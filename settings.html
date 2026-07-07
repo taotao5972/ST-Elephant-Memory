@@ -31,6 +31,30 @@
 
             <hr />
 
+            <b>遗忘衰减 · 越远越糊，事实不糊</b>
+
+            <label class="checkbox_label" for="hm_decay_enabled">
+                <input id="hm_decay_enabled" type="checkbox" />
+                <span>启用（摘要攒多时自动归档成远期梗概 + 维护事实账本）</span>
+            </label>
+
+            <label for="hm_decay_threshold">
+                <span>摘要超过多少段时触发衰减</span>
+            </label>
+            <input id="hm_decay_threshold" type="number" class="text_pole" min="2" step="1" />
+
+            <label for="hm_decay_batch">
+                <span>每次归档最老的几段</span>
+            </label>
+            <input id="hm_decay_batch" type="number" class="text_pole" min="1" step="1" />
+
+            <label for="hm_decay_max_words">
+                <span>远期梗概字数上限</span>
+            </label>
+            <input id="hm_decay_max_words" type="number" class="text_pole" min="50" step="50" />
+
+            <hr />
+
             <b>远期层 · 向量召回</b>
 
             <label class="checkbox_label" for="hm_vector_enabled">
@@ -64,8 +88,8 @@
                 <div class="menu_button" id="hm_compress_now" title="立即把最近 N 轮之外的对话全部压成摘要">
                     <i class="fa-solid fa-compress"></i> 立即压缩
                 </div>
-                <div class="menu_button" id="hm_view_summaries" title="查看并手动编辑本聊天的所有摘要">
-                    <i class="fa-solid fa-book"></i> 查看/编辑摘要
+                <div class="menu_button" id="hm_view_summaries" title="查看并手动编辑账本/梗概/摘要">
+                    <i class="fa-solid fa-book"></i> 查看/编辑记忆
                 </div>
                 <div class="menu_button" id="hm_rebuild_vectors" title="清空并重建本聊天的向量库（把所有已压缩消息重新入库）">
                     <i class="fa-solid fa-rotate"></i> 重建向量库

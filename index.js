@@ -30,6 +30,8 @@ const TEMPLATE_PATH = `third-party/${FOLDER_NAME}`;
 
 // 防止同一时间跑两次压缩
 let compressing = false;
+// 痛点修复：主生成进行中时避让，不让后台压缩和你的对话生成撞车抢 API
+let generating = false;
 
 /** 取 SillyTavern 上下文。官方推荐每次现取，不要缓存（切聊天后引用会变） */
 function ctx() {
@@ -57,6 +59,15 @@ const defaultSettings = Object.freeze({
     vectorSource: 'transformers',
     // 部分来源需要指定 embedding 模型名（如 openai 的 text-embedding-3-small）；transformers 留空
     vectorModel: '',
+    // ---- 遗忘衰减（越远越糊）----
+    // 开关：摘要条数超过阈值时，把最老的一批二次压缩成"远期梗概"，并维护事实账本
+    decayEnabled: true,
+    // 摘要条数超过多少段时触发衰减
+    decayThreshold: 10,
+    // 每次衰减归档最老的几段摘要
+    decayBatch: 5,
+    // 远期梗概的字数上限（它是"一段"常驻文本，会随每次衰减融合刷新）
+    decayMaxWords: 300,
     // 摘要 prompt 模板。{{messages}} 会被替换成待压缩的对话原文，{{words}} 替换成字数上限
     promptTemplate: [
         '你是一个剧情记忆压缩器。请把下面这段角色扮演对话压缩成一段剧情摘要，字数不超过{{words}}字。',
@@ -64,11 +75,33 @@ const defaultSettings = Object.freeze({
         '- 保留：关键事件、人物关系的变化、重要的承诺或约定、有标志性的台词（可直接引用）',
         '- 丢弃：寒暄、重复的动作神态描写、与主线无关的闲聊',
         '- 用第三人称、过去时叙述，客观、精炼、按时间顺序',
+        '- 摘要语言跟随对话原文的主要语言',
         '',
         '对话原文：',
         '{{messages}}',
         '',
         '只输出摘要正文，不要任何解释、标题或前后缀。',
+    ].join('\n'),
+    // 衰减 prompt 模板。输出必须带 <账本> 和 <梗概> 标记，便于程序解析
+    decayPromptTemplate: [
+        '你是一个剧情记忆管理器。下面是三部分材料：',
+        '',
+        '【现有事实账本】',
+        '{{ledger}}',
+        '',
+        '【现有远期梗概】',
+        '{{epic}}',
+        '',
+        '【待归档的剧情摘要（由旧到新）】',
+        '{{summaries}}',
+        '',
+        '请输出两部分，严格使用以下标记包裹，标记外不要有任何内容：',
+        '<账本>',
+        '更新后的事实账本：合并新旧信息，只记录长期有效的事实——人物关系与称呼、重要承诺或约定、身份与秘密、关键物品与设定。每条一行以"- "开头，去重，不写具体情节。没有可记的就保留原账本。',
+        '</账本>',
+        '<梗概>',
+        '把现有梗概与待归档摘要融合成一段不超过{{words}}字的远期剧情梗概：只保留主线脉络与重大转折，允许模糊细节，第三人称过去时，语言跟随原文。',
+        '</梗概>',
     ].join('\n'),
 });
 
@@ -91,14 +124,21 @@ function getSettings() {
  * ====================================================================== */
 
 /**
- * @returns {{ summaries: Array<{text: string, rounds: number, messageCount: number, createdAt: number}> }}
+ * 记忆状态三件套：
+ *   summaries   — 中期层：剧情摘要数组（由旧到新）
+ *   epicSummary — 远期层：一段"远期梗概"，衰减时与最老的摘要融合刷新（越远越糊）
+ *   factLedger  — 事实账本：长期有效的事实（关系/承诺/秘密/设定），永不衰减
+ * @returns {{ summaries: Array<{text: string, rounds: number, messageCount: number, createdAt: number}>, epicSummary: string, factLedger: string }}
  */
 function getMemoryState() {
     const { chatMetadata } = ctx();
     if (!chatMetadata[MODULE_NAME] || !Array.isArray(chatMetadata[MODULE_NAME].summaries)) {
         chatMetadata[MODULE_NAME] = { summaries: [] };
     }
-    return chatMetadata[MODULE_NAME];
+    const state = chatMetadata[MODULE_NAME];
+    if (typeof state.epicSummary !== 'string') state.epicSummary = '';
+    if (typeof state.factLedger !== 'string') state.factLedger = '';
+    return state;
 }
 
 /* ========================================================================
@@ -203,6 +243,9 @@ async function compressOldestRounds(roundsToCompress, silent = true) {
         // 5) 远期层：被压缩的原文入向量库（失败只降级，不影响压缩结果）
         await vectorizeMessages(batch);
 
+        // 6) 遗忘衰减：摘要攒多了就把最老的一批归档成"远期梗概"+更新事实账本
+        await maybeDecay();
+
         refreshCompressedStyling();
         updateStatusLine();
         if (!silent) toastr.success(`已压缩 ${batch.length} 条消息为 1 段摘要`, '分层记忆');
@@ -215,6 +258,55 @@ async function compressOldestRounds(roundsToCompress, silent = true) {
     }
 }
 
+/* ========================================================================
+ * 4.2 遗忘衰减：越远越糊，但事实不糊
+ *
+ * 摘要条数超过阈值时，把最老的一批摘要 + 现有梗概 + 现有账本一起丢给 LLM：
+ *   - 长期有效的事实（关系/承诺/秘密/设定）合并进【事实账本】——永不衰减，
+ *     因为这些糊掉角色就 OOC 了；
+ *   - 情节脉络融合成一段固定字数上限的【远期梗概】——细节允许模糊，
+ *     反正原文都在向量库里，聊到相关话题还能被"唤醒"。
+ * 解析失败就整体放弃本次衰减（摘要原样保留），绝不丢数据。
+ * 注意：衰减最多只做这一层（摘要→梗概），不再递归——LLM 反复摘要自己的
+ * 摘要会像复印复印件一样指数级失真。
+ * ====================================================================== */
+async function maybeDecay() {
+    const settings = getSettings();
+    if (!settings.decayEnabled) return;
+
+    const state = getMemoryState();
+    const threshold = Math.max(2, Number(settings.decayThreshold) || 10);
+    if (state.summaries.length <= threshold) return;
+
+    const batchSize = Math.max(1, Number(settings.decayBatch) || 5);
+    const batch = state.summaries.slice(0, batchSize);
+
+    try {
+        console.log(`[${MODULE_NAME}] decaying ${batch.length} oldest summaries into epic`);
+        const prompt = settings.decayPromptTemplate
+            .replace('{{ledger}}', () => state.factLedger || '（暂无）')
+            .replace('{{epic}}', () => state.epicSummary || '（暂无）')
+            .replace('{{summaries}}', () => batch.map((s, i) => `${i + 1}. ${s.text}`).join('\n'))
+            .replace('{{words}}', () => String(settings.decayMaxWords));
+
+        const output = String(await ctx().generateRaw({ prompt }) ?? '');
+        const ledgerMatch = output.match(/<账本>([\s\S]*?)<\/账本>/);
+        const epicMatch = output.match(/<梗概>([\s\S]*?)<\/梗概>/);
+        // 两个标记都解析到才动数据，否则整体放弃（安全降级，摘要原样保留）
+        if (!ledgerMatch || !epicMatch) throw new Error('输出缺少 <账本>/<梗概> 标记，放弃本次衰减');
+
+        state.factLedger = ledgerMatch[1].trim();
+        state.epicSummary = epicMatch[1].trim();
+        state.summaries = state.summaries.slice(batch.length);
+        await ctx().saveMetadata();
+        updateStatusLine();
+        console.log(`[${MODULE_NAME}] decay done: ledger ${state.factLedger.length} chars, epic ${state.epicSummary.length} chars`);
+    } catch (error) {
+        console.error(`[${MODULE_NAME}] decay failed (summaries kept intact):`, error);
+        toastr.warning('遗忘衰减失败，摘要原样保留（详见 Console）', '分层记忆');
+    }
+}
+
 /**
  * 监听器入口：每当 AI 回复入库(MESSAGE_RECEIVED)就检查是否该压缩。
  * 触发条件：未压缩轮数 ≥ 2N。压掉最老的 (未压缩轮数 - N) 轮，
@@ -222,7 +314,7 @@ async function compressOldestRounds(roundsToCompress, silent = true) {
  */
 async function maybeAutoCompress() {
     const settings = getSettings();
-    if (!settings.enabled || compressing) return;
+    if (!settings.enabled || compressing || generating) return;
 
     const { chat } = ctx();
     const rounds = countUncompressedRounds(chat);
@@ -289,9 +381,9 @@ function messageToChunk(message) {
  * 把一批（刚被压缩的）消息写入向量库。
  * 先取已有 hash 列表做去重，避免重复入库。
  */
-async function vectorizeMessages(batch) {
+async function vectorizeMessages(batch, silent = false) {
     const settings = getSettings();
-    if (!settings.vectorEnabled) return;
+    if (!settings.vectorEnabled || batch.length === 0) return;
     try {
         const collectionId = getCollectionId();
         const existing = new Set((await vectorApi('list', vectorBody({ collectionId }))) ?? []);
@@ -306,7 +398,7 @@ async function vectorizeMessages(batch) {
     } catch (error) {
         // 向量化失败不阻断压缩流程（首次使用 transformers 时服务端要先下载模型，可能较慢）
         console.error(`[${MODULE_NAME}] vectorize failed (recall degraded):`, error);
-        toastr.warning('向量化失败，本批原文暂不可召回（详见 Console）', '分层记忆');
+        if (!silent) toastr.warning('向量化失败，本批原文暂不可召回（详见 Console）', '分层记忆');
     }
 }
 
@@ -364,8 +456,14 @@ globalThis.hierarchicalMemoryInterceptor = async function (chat, _contextSize, _
         const settings = getSettings();
         if (!settings.enabled) return;
 
-        // 0) 先记下"最后一条用户消息"，作为向量召回的查询文本（要在剔除前取）
-        const lastUserMessage = [...chat].reverse().find((m) => m.is_user && !m.is_system);
+        // 0) 先取召回查询文本（要在剔除前取）。
+        //    痛点修复：只用最后一条用户消息当查询，遇到"嗯，然后呢"这种短句
+        //    召回质量极差 —— 所以拼上前一条 AI 消息一起查，语义信息足得多
+        const reversed = [...chat].reverse();
+        const lastUserMessage = reversed.find((m) => m.is_user && !m.is_system);
+        const lastAiMessage = reversed.find((m) => !m.is_user && !m.is_system && !isCompressed(m));
+        const queryText = [lastAiMessage?.mes, lastUserMessage?.mes]
+            .filter(Boolean).join('\n').slice(-1500); // 只留末尾 1500 字符，足够做 embedding
 
         // 1) 把已压缩的原文从"待发送数组"里剔除（倒序遍历避免 splice 移位）
         for (let i = chat.length - 1; i >= 0; i--) {
@@ -375,25 +473,34 @@ globalThis.hierarchicalMemoryInterceptor = async function (chat, _contextSize, _
         const state = getMemoryState();
         const injected = [];
 
-        // 2) 中期层：把所有摘要拼成一条"记忆消息"
+        // 2) 组装"记忆消息"：账本（事实，永不衰减）→ 远期梗概（糊）→ 剧情摘要（清楚些）
+        const sections = [];
+        if (state.factLedger) {
+            sections.push('【事实账本 · 长期有效】以下事实持续成立，任何时候都不可违背：\n' + state.factLedger);
+        }
+        if (state.epicSummary) {
+            sections.push('【远期剧情梗概】更早剧情的主线脉络：\n' + state.epicSummary);
+        }
         if (state.summaries.length > 0) {
-            const block =
-                '【剧情记忆摘要 · 由旧到新】以下是本次对话更早剧情的压缩记忆，请视为已发生的事实并保持一致：\n'
-                + state.summaries.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
+            sections.push(
+                '【剧情记忆摘要 · 由旧到新】以下是较早剧情的压缩记忆，请视为已发生的事实并保持一致：\n'
+                + state.summaries.map((s, i) => `${i + 1}. ${s.text}`).join('\n'));
+        }
+        const hasMemory = sections.length > 0;
+        if (hasMemory) {
             injected.push({
                 name: 'Memory',
                 is_user: false,
                 is_system: false, // is_system=true 会被组 prompt 时排除，所以必须是 false
                 send_date: Date.now(),
-                mes: block,
+                mes: sections.join('\n\n'),
                 extra: { [MODULE_NAME]: { injected: true } },
             });
         }
 
         // 3) 远期层：按当前输入语义检索，召回相关的过往原文（想起才想起）
-        //    只有存在摘要（= 有东西被压缩过）时才值得查
-        if (state.summaries.length > 0 && lastUserMessage) {
-            const chunks = await recallRelatedChunks(lastUserMessage.mes);
+        if (hasMemory && queryText) {
+            const chunks = await recallRelatedChunks(queryText);
             if (chunks.length > 0) {
                 const recallBlock =
                     '【记忆唤醒】以下是与当前话题语义相关的过往对话原文片段（补充细节用，以剧情摘要为准）：\n'
@@ -434,43 +541,69 @@ function refreshCompressedStyling() {
     });
 }
 
-/** 更新设置面板里的状态行 */
-function updateStatusLine() {
+/** 更新设置面板里的状态行（含记忆占用的 token 估算，让省了多少心里有数） */
+async function updateStatusLine() {
     const el = $('#hm_status');
     if (!el.length) return;
     try {
         const { chat } = ctx();
         const state = getMemoryState();
         const compressedCount = chat.filter(isCompressed).length;
+        // 记忆块 = 账本 + 梗概 + 所有摘要；优先用 ST 的分词器精确计数，不行就按字符粗估
+        const memoryText = [state.factLedger, state.epicSummary, ...state.summaries.map((s) => s.text)]
+            .filter(Boolean).join('\n');
+        let tokenInfo = '';
+        if (memoryText) {
+            const tokens = (await ctx().getTokenCountAsync?.(memoryText)?.catch(() => null))
+                ?? Math.ceil(memoryText.length / 2);
+            tokenInfo = ` · 记忆占用约 ${tokens} token`;
+        }
         el.text(
-            `摘要 ${state.summaries.length} 段 · 已压缩 ${compressedCount} 条消息 · `
-            + `未压缩 ${countUncompressedRounds(chat)} 轮`,
+            `摘要 ${state.summaries.length} 段${state.epicSummary ? ' + 梗概' : ''}${state.factLedger ? ' + 账本' : ''}`
+            + ` · 已压缩 ${compressedCount} 条消息 · 未压缩 ${countUncompressedRounds(chat)} 轮${tokenInfo}`,
         );
     } catch {
         el.text('（未加载聊天）');
     }
 }
 
-/** 「查看/编辑摘要」弹窗：一个大文本框，段与段之间用 --- 分隔，改完保存回 chatMetadata */
+/** 「查看/编辑记忆」弹窗：账本、梗概、摘要（--- 分隔）三个文本框，改完保存回 chatMetadata */
 async function showSummaryEditor() {
     const { Popup, POPUP_TYPE, saveMetadata } = ctx();
     const state = getMemoryState();
     const SEP = '\n\n---\n\n';
-    const initial = state.summaries.map((s) => s.text).join(SEP);
+    const initial = {
+        ledger: state.factLedger,
+        epic: state.epicSummary,
+        summaries: state.summaries.map((s) => s.text).join(SEP),
+    };
+    const edited = { ...initial };
 
-    let edited = initial;
     const html = document.createElement('div');
     html.innerHTML = `
+        <h3>事实账本（长期有效，永不衰减，一行一条）</h3>
+        <textarea id="hm_edit_ledger" class="text_pole" rows="5" style="width:100%;"></textarea>
+        <h3>远期剧情梗概（越远越糊的那一段）</h3>
+        <textarea id="hm_edit_epic" class="text_pole" rows="4" style="width:100%;"></textarea>
         <h3>剧情记忆摘要（由旧到新，段落间用 --- 分隔）</h3>
-        <textarea id="hm_edit_area" class="text_pole" rows="16" style="width:100%;"></textarea>`;
-    html.querySelector('#hm_edit_area').value = initial;
-    html.querySelector('#hm_edit_area').addEventListener('input', (e) => { edited = e.target.value; });
+        <textarea id="hm_edit_area" class="text_pole" rows="10" style="width:100%;"></textarea>`;
+    html.querySelector('#hm_edit_ledger').value = initial.ledger;
+    html.querySelector('#hm_edit_epic').value = initial.epic;
+    html.querySelector('#hm_edit_area').value = initial.summaries;
+    html.querySelector('#hm_edit_ledger').addEventListener('input', (e) => { edited.ledger = e.target.value; });
+    html.querySelector('#hm_edit_epic').addEventListener('input', (e) => { edited.epic = e.target.value; });
+    html.querySelector('#hm_edit_area').addEventListener('input', (e) => { edited.summaries = e.target.value; });
 
     const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, okButton: '保存', cancelButton: '取消' });
     const result = await popup.show();
 
-    if (result && edited !== initial) {
-        const texts = edited.split(/\n\s*---\s*\n/).map((t) => t.trim()).filter(Boolean);
+    const changed = edited.ledger !== initial.ledger
+        || edited.epic !== initial.epic
+        || edited.summaries !== initial.summaries;
+    if (result && changed) {
+        state.factLedger = edited.ledger.trim();
+        state.epicSummary = edited.epic.trim();
+        const texts = edited.summaries.split(/\n\s*---\s*\n/).map((t) => t.trim()).filter(Boolean);
         // 尽量保留原条目的元信息；多出来/对不上的按新条目处理
         state.summaries = texts.map((text, i) => ({
             ...(state.summaries[i] ?? { rounds: 0, messageCount: 0, createdAt: Date.now() }),
@@ -478,7 +611,7 @@ async function showSummaryEditor() {
         }));
         await saveMetadata();
         updateStatusLine();
-        toastr.success('摘要已保存', '分层记忆');
+        toastr.success('记忆已保存', '分层记忆');
     }
 }
 
@@ -488,7 +621,10 @@ async function clearMemory() {
     const ok = await Popup.show.confirm('分层记忆', '清空本聊天的所有摘要，并恢复全部原文进入上下文？');
     if (!ok) return;
 
-    getMemoryState().summaries = [];
+    const state = getMemoryState();
+    state.summaries = [];
+    state.epicSummary = '';
+    state.factLedger = '';
     chat.forEach((message) => {
         if (message.extra?.[MODULE_NAME]) delete message.extra[MODULE_NAME];
     });
@@ -556,6 +692,29 @@ async function initSettingsUi() {
         toastr.info('已恢复默认摘要 prompt', '分层记忆');
     });
 
+    // ---- 遗忘衰减设置 ----
+    $('#hm_decay_enabled').prop('checked', settings.decayEnabled);
+    $('#hm_decay_threshold').val(settings.decayThreshold);
+    $('#hm_decay_batch').val(settings.decayBatch);
+    $('#hm_decay_max_words').val(settings.decayMaxWords);
+
+    $('#hm_decay_enabled').on('change', function () {
+        getSettings().decayEnabled = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#hm_decay_threshold').on('input', function () {
+        getSettings().decayThreshold = Math.max(2, Number($(this).val()) || 10);
+        saveSettingsDebounced();
+    });
+    $('#hm_decay_batch').on('input', function () {
+        getSettings().decayBatch = Math.max(1, Number($(this).val()) || 5);
+        saveSettingsDebounced();
+    });
+    $('#hm_decay_max_words').on('input', function () {
+        getSettings().decayMaxWords = Math.max(50, Number($(this).val()) || 300);
+        saveSettingsDebounced();
+    });
+
     // ---- 向量召回设置 ----
     $('#hm_vector_enabled').prop('checked', settings.vectorEnabled);
     $('#hm_vector_topk').val(settings.vectorTopK);
@@ -601,16 +760,29 @@ jQuery(async () => {
 
     await initSettingsUi();
 
-    // AI 回复入库后：检查是否攒够了、该压缩了（稍微延迟，避开渲染高峰）
+    // 主生成期间打旗避让，压缩等生成结束再跑
+    eventSource.on(event_types.GENERATION_STARTED, () => { generating = true; });
+    eventSource.on(event_types.GENERATION_STOPPED, () => { generating = false; });
+    eventSource.on(event_types.GENERATION_ENDED, () => {
+        generating = false;
+        // 生成彻底结束后再检查压缩（比 MESSAGE_RECEIVED 时机更稳，不撞车）
+        setTimeout(() => maybeAutoCompress(), 800);
+    });
+
+    // AI 回复入库后也检查一次（双保险；有 compressing/generating 旗子，重复调用无害）
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
         setTimeout(() => maybeAutoCompress(), 800);
     });
 
-    // 切换聊天后：重新渲染置灰样式、刷新状态行
+    // 切换聊天后：重新渲染置灰样式、刷新状态行；
+    // 痛点修复：分支/checkpoint 聊天的 chatId 是新的，向量集合是空的——
+    // 静默补录所有已压缩消息（入库自带去重，正常聊天时这一步等于空转）
     eventSource.on(event_types.CHAT_CHANGED, () => {
         setTimeout(() => {
             refreshCompressedStyling();
             updateStatusLine();
+            const compressed = ctx().chat.filter(isCompressed);
+            if (compressed.length > 0) vectorizeMessages(compressed, true);
         }, 300);
     });
 
