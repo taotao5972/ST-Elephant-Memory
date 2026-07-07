@@ -1,0 +1,47 @@
+/* 已被压缩进摘要层的消息：置灰 + 角标，提示"这条不再发给模型" */
+#chat .mes.hm-compressed {
+    opacity: 0.45;
+    position: relative;
+}
+
+#chat .mes.hm-compressed::after {
+    content: '已入摘要';
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    font-size: 0.7em;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background-color: var(--SmartThemeQuoteColor, #888);
+    color: var(--SmartThemeBlurTintColor, #fff);
+    opacity: 0.8;
+    pointer-events: none;
+}
+
+/* 设置面板 */
+.hierarchical-memory-settings .hm-status {
+    margin: 6px 0 10px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background-color: var(--black30a, rgba(0, 0, 0, 0.2));
+    font-size: 0.85em;
+    opacity: 0.9;
+}
+
+.hierarchical-memory-settings .hm-buttons {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 8px 0;
+}
+
+.hierarchical-memory-settings .hm-hint {
+    display: block;
+    margin-top: 6px;
+    opacity: 0.7;
+}
+
+.hierarchical-memory-settings label {
+    display: block;
+    margin-top: 8px;
+}

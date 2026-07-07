@@ -1,0 +1,84 @@
+<div class="hierarchical-memory-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>分层记忆 Hierarchical Memory</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <label class="checkbox_label" for="hm_enabled">
+                <input id="hm_enabled" type="checkbox" />
+                <span>启用（自动压缩 + 摘要注入）</span>
+            </label>
+
+            <div id="hm_status" class="hm-status">…</div>
+
+            <label for="hm_rounds_n">
+                <span>N — 近期层保留轮数（未压缩攒到 2N 轮时，压掉最老的 N 轮）</span>
+            </label>
+            <input id="hm_rounds_n" type="number" class="text_pole" min="1" step="1" />
+
+            <label for="hm_max_words">
+                <span>单段摘要字数上限</span>
+            </label>
+            <input id="hm_max_words" type="number" class="text_pole" min="20" step="10" />
+
+            <label for="hm_prompt">
+                <span>摘要 prompt 模板（\{{messages}} = 待压缩原文，\{{words}} = 字数上限）</span>
+            </label>
+            <textarea id="hm_prompt" class="text_pole textarea_compact" rows="8"></textarea>
+            <div class="menu_button" id="hm_prompt_reset">恢复默认 prompt</div>
+
+            <hr />
+
+            <b>远期层 · 向量召回</b>
+
+            <label class="checkbox_label" for="hm_vector_enabled">
+                <input id="hm_vector_enabled" type="checkbox" />
+                <span>启用向量召回（压缩掉的原文可按语义"想起"）</span>
+            </label>
+
+            <label for="hm_vector_topk">
+                <span>每次最多召回的原文段数</span>
+            </label>
+            <input id="hm_vector_topk" type="number" class="text_pole" min="1" max="10" step="1" />
+
+            <label for="hm_vector_threshold">
+                <span>相似度阈值（0~1，越高越严格，本地模型建议 0.2~0.4）</span>
+            </label>
+            <input id="hm_vector_threshold" type="number" class="text_pole" min="0" max="1" step="0.05" />
+
+            <label for="hm_vector_source">
+                <span>Embedding 来源（默认 transformers = 本地模型零配置）</span>
+            </label>
+            <input id="hm_vector_source" type="text" class="text_pole" placeholder="transformers" />
+
+            <label for="hm_vector_model">
+                <span>Embedding 模型名（transformers 留空；如 openai 填 text-embedding-3-small）</span>
+            </label>
+            <input id="hm_vector_model" type="text" class="text_pole" placeholder="留空使用默认" />
+
+            <hr />
+
+            <div class="hm-buttons">
+                <div class="menu_button" id="hm_compress_now" title="立即把最近 N 轮之外的对话全部压成摘要">
+                    <i class="fa-solid fa-compress"></i> 立即压缩
+                </div>
+                <div class="menu_button" id="hm_view_summaries" title="查看并手动编辑本聊天的所有摘要">
+                    <i class="fa-solid fa-book"></i> 查看/编辑摘要
+                </div>
+                <div class="menu_button" id="hm_rebuild_vectors" title="清空并重建本聊天的向量库（把所有已压缩消息重新入库）">
+                    <i class="fa-solid fa-rotate"></i> 重建向量库
+                </div>
+                <div class="menu_button" id="hm_clear" title="删除所有摘要并恢复原文进入上下文">
+                    <i class="fa-solid fa-trash"></i> 清空记忆
+                </div>
+            </div>
+
+            <small class="hm-hint">
+                被压缩的消息在聊天里会置灰并带「已入摘要」角标，原文不会被删除，
+                每次发送时会自动替换为【历史摘要】+【最近 N 轮原文】。
+            </small>
+        </div>
+    </div>
+</div>

@@ -1,0 +1,13 @@
+{
+    "display_name": "Hierarchical Memory (分层记忆)",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "VV & Adam",
+    "version": "0.2.0",
+    "homePage": "https://github.com/taotao5972/ST-Elephant-Memory",
+    "generate_interceptor": "hierarchicalMemoryInterceptor",
+    "minimum_client_version": "1.12.0"
+}
